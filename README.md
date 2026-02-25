@@ -2,9 +2,15 @@
 
 #clone git repo
 
-# create a virtual environment
+# create and activate virtual environment
 
   python -m venv venv
+
+  # Windows:
+  .\venv\Scripts\Activate
+
+  # Liunx
+  source venv/bin/activate
 
 # install the requirements
 
@@ -13,4 +19,3 @@
 # run the app
 
   streamlit run vram_app.py
-
