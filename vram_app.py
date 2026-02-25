@@ -1,4 +1,6 @@
 import math
+import re
+import urllib.parse
 import streamlit as st
 from dataclasses import dataclass
 import pandas as pd
@@ -6,6 +8,7 @@ from huggingface_hub import list_models
 from transformers import AutoConfig
 import ollama
 import requests
+from bs4 import BeautifulSoup
 from torchinfo import summary
 import torch
 import altair as alt
@@ -119,25 +122,126 @@ with st.sidebar:
                     st.error("Config load failed; use defaults or Custom.")
 
     with tab2:
+        # ── Local installed models ──────────────────────────────────────────
+        st.markdown("**Local Models**")
         if st.button("Fetch Local Ollama Models"):
-            local_models = ollama.list().get('models', [])
-            ollama_options = [m['name'] for m in local_models]
-            selected_ollama = st.selectbox("Select Ollama model", ollama_options)
+            try:
+                response = ollama.list()
+                st.session_state['ollama_models'] = [m.model for m in response.models]
+            except Exception as e:
+                st.error(f"Failed to connect to Ollama: {e}")
+
+        if st.session_state.get('ollama_models'):
+            selected_ollama = st.selectbox("Select local model", st.session_state['ollama_models'])
             if selected_ollama:
-                details = ollama.show(selected_ollama)
-                params_bil = float(details.get('parameters', '8B').replace('B', ''))
-                layers = details.get('num_layers', 32)
-                hidden = details.get('hidden_size', 4096)
-        if st.button("Check Latest Ollama Library"):
-            response = requests.get("https://ollama.com/library?json=true")
-            if response.ok:
-                latest = response.json().get('models', [])[:10]
-                st.write("Latest:", [m['name'] for m in latest])
+                try:
+                    details = ollama.show(selected_ollama)
+                    model_details = getattr(details, 'details', None)
+                    param_size_str = getattr(model_details, 'parameter_size', '8B') or '8B'
+                    params_bil = float(param_size_str.upper().replace('B', '').strip() or 8.0)
+                    model_info = getattr(details, 'model_info', {}) or {}
+                    layers = int(model_info.get('llm.block_count', 32))
+                    hidden = int(model_info.get('llm.embedding_length', 4096))
+                    st.session_state['ollama_selected_params'] = (params_bil, layers, hidden)
+                except Exception as e:
+                    st.error(f"Failed to load model details: {e}")
+
+        st.divider()
+
+        # ── Browse Ollama Library ───────────────────────────────────────────
+        st.markdown("**Browse Ollama Library**")
+
+        def _fetch_ollama_search(query, sort):
+            sort_param = "newest" if sort == "Newest" else "popular"
+            url = f"https://ollama.com/search?q={urllib.parse.quote(query)}&sort={sort_param}"
+            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            results = []
+            for a in soup.find_all("a", href=lambda h: h and h.startswith("/library/")):
+                name_el = a.find("span", attrs={"x-test-search-response-title": True})
+                if not name_el:
+                    continue
+                sizes = [s.get_text(strip=True) for s in a.find_all("span", attrs={"x-test-size": True})]
+                caps  = [s.get_text(strip=True) for s in a.find_all("span", attrs={"x-test-capability": True})]
+                pulls_el = a.find("span", attrs={"x-test-pull-count": True})
+                results.append({
+                    "name":  name_el.get_text(strip=True),
+                    "sizes": sizes,
+                    "tags":  caps,
+                    "pulls": pulls_el.get_text(strip=True) if pulls_el else "",
+                })
+            return results
+
+        col_q, col_s = st.columns([3, 1])
+        with col_q:
+            lib_query = st.text_input("Search", placeholder="e.g. llama, qwen, mistral", key="lib_query")
+        with col_s:
+            lib_sort = st.selectbox("Sort", ["Popular", "Newest"], key="lib_sort")
+
+        if st.button("Search Library"):
+            if lib_query.strip():
+                try:
+                    with st.spinner("Searching…"):
+                        st.session_state["lib_results"] = _fetch_ollama_search(lib_query.strip(), lib_sort)
+                        st.session_state["lib_search_key"] = lib_query.strip()
+                except Exception as e:
+                    st.error(f"Search failed: {e}")
+            else:
+                st.warning("Enter a search term first.")
+
+        lib_results = st.session_state.get("lib_results", [])
+        if lib_results:
+            # Filter controls
+            all_sizes = sorted(set(s for m in lib_results for s in m["sizes"]))
+            all_tags  = sorted(set(t for m in lib_results for t in m["tags"]))
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                size_filter = st.multiselect("Filter by size", all_sizes, key="lib_size_filter")
+            with fc2:
+                tag_filter = st.multiselect("Filter by capability", all_tags, key="lib_tag_filter")
+
+            filtered = lib_results
+            if size_filter:
+                filtered = [m for m in filtered if any(s in m["sizes"] for s in size_filter)]
+            if tag_filter:
+                filtered = [m for m in filtered if any(t in m["tags"] for t in tag_filter)]
+
+            if filtered:
+                df_lib = pd.DataFrame([{
+                    "Model": m["name"],
+                    "Sizes": ", ".join(m["sizes"]) or "—",
+                    "Capabilities": ", ".join(m["tags"]) or "—",
+                    "Pulls": m["pulls"],
+                } for m in filtered])
+                st.dataframe(df_lib, use_container_width=True, hide_index=True)
+
+                sel_name = st.selectbox("Select model", [m["name"] for m in filtered], key="lib_sel_name")
+                sel_data = next((m for m in filtered if m["name"] == sel_name), None)
+
+                if sel_data:
+                    if sel_data["sizes"]:
+                        sel_size = st.selectbox("Select size", sel_data["sizes"], key="lib_sel_size")
+                        # Parse param count from size string (e.g. "70b" → 70.0, "0.5b" → 0.5)
+                        m = re.match(r"(\d+\.?\d*)([bBmMkK])", sel_size.split("x")[-1])
+                        if m:
+                            val, unit = float(m.group(1)), m.group(2).lower()
+                            params_bil = val if unit == "b" else (val / 1e3 if unit == "m" else val / 1e6)
+                            st.session_state["ollama_selected_params"] = (params_bil, layers, hidden)
+                    else:
+                        st.info("No size tags — set parameters in the Custom tab.")
+            else:
+                st.info("No models match the current filters.")
 
     with tab3:
-        params_bil = st.number_input("Parameters (B)", min_value=0.1, value=8.0)
-        layers = st.number_input("Layers", min_value=1, value=32)
-        hidden = st.number_input("Hidden size", min_value=256, value=4096)
+        _sel = st.session_state.get("ollama_selected_params", (8.0, 32, 4096))
+        params_bil = st.number_input("Parameters (B)", min_value=0.1, value=float(_sel[0]))
+        layers = st.number_input("Layers", min_value=1, value=int(_sel[1]))
+        hidden = st.number_input("Hidden size", min_value=256, value=int(_sel[2]))
+
+    # Use session-state values from tab1/tab2 if set, else fall back to tab3 inputs
+    if "ollama_selected_params" in st.session_state:
+        params_bil, layers, hidden = st.session_state["ollama_selected_params"]
 
     shape = ModelShape(params_bil, layers, hidden)
 
