@@ -318,5 +318,131 @@ with right:
         st.download_button("Download", csv, "vram_report.csv", "text/csv")
 
 st.divider()
+st.subheader("🔍 Model Discovery")
+st.caption("Find Ollama and HuggingFace models that fit your available VRAM")
+
+with st.expander("Configure & Run Discovery", expanded=False):
+    dc1, dc2, dc3, dc4 = st.columns(4)
+    with dc1:
+        disc_vram = st.number_input("Your VRAM (GB)", min_value=1.0, value=float(per_gpu_vram), step=1.0, key="disc_vram")
+    with dc2:
+        disc_prec = st.selectbox("Precision", list(BYTES_PER.keys()), index=2, key="disc_prec")
+    with dc3:
+        disc_pages = st.slider("Ollama pages to scan", 1, 20, 5, key="disc_pages",
+                               help="Each page = 20 models from ollama.com/search sorted by popularity")
+    with dc4:
+        disc_overhead = st.slider("Overhead factor", 1.0, 2.0, 1.25, 0.05, key="disc_overhead",
+                                  help="Multiplier for KV cache + activation overhead on top of raw weights")
+
+    disc_source = st.multiselect(
+        "Sources to scan",
+        ["Ollama Library", "HuggingFace"],
+        default=["Ollama Library"],
+        key="disc_source",
+    )
+
+    if st.button("Find Compatible Models", key="disc_btn"):
+        bytes_per = BYTES_PER[disc_prec]
+        max_params_bil = (disc_vram * 1e9) / (bytes_per * disc_overhead) / 1e9
+        compatible = []
+
+        if "Ollama Library" in disc_source:
+            prog = st.progress(0, text="Scanning Ollama library…")
+            for i in range(disc_pages):
+                prog.progress((i + 1) / disc_pages, text=f"Scanning Ollama page {i+1}/{disc_pages}…")
+                try:
+                    resp = requests.get(
+                        f"https://ollama.com/search?p={i+1}",
+                        timeout=10, headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                    resp.raise_for_status()
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    for a in soup.find_all("a", href=lambda h: h and h.startswith("/library/")):
+                        name_el = a.find("span", attrs={"x-test-search-response-title": True})
+                        if not name_el:
+                            continue
+                        pulls_el = a.find("span", attrs={"x-test-pull-count": True})
+                        name = name_el.get_text(strip=True)
+                        sizes = [s.get_text(strip=True) for s in a.find_all("span", attrs={"x-test-size": True})]
+                        caps  = [s.get_text(strip=True) for s in a.find_all("span", attrs={"x-test-capability": True})]
+                        for size in (sizes or [""]):
+                            match = re.match(r"(\d+\.?\d*)([bBmMkK])", size.split("x")[-1]) if size else None
+                            if match:
+                                val, unit = float(match.group(1)), match.group(2).lower()
+                                p = val if unit == "b" else (val / 1e3 if unit == "m" else val / 1e6)
+                            else:
+                                continue
+                            if p <= max_params_bil:
+                                compatible.append({
+                                    "Source": "Ollama",
+                                    "Model": name,
+                                    "Tag": size,
+                                    "Params (B)": p,
+                                    "Est. VRAM (GB)": round(p * bytes_per * disc_overhead, 1),
+                                    "Capabilities": ", ".join(caps) or "—",
+                                    "Pulls": pulls_el.get_text(strip=True) if pulls_el else "",
+                                })
+                except Exception:
+                    continue
+            prog.empty()
+
+        if "HuggingFace" in disc_source:
+            with st.spinner("Scanning HuggingFace top models…"):
+                try:
+                    hf_models = list(list_models(filter="text-generation", sort="downloads", direction=-1, limit=200))
+                    for hf_m in hf_models:
+                        nm = re.search(
+                            r'(\d+\.?\d*)\s*[bB](?!\w)',
+                            hf_m.id.replace("-", " ").replace("_", " ")
+                        )
+                        if nm:
+                            p = float(nm.group(1))
+                            if p <= max_params_bil:
+                                compatible.append({
+                                    "Source": "HuggingFace",
+                                    "Model": hf_m.id,
+                                    "Tag": f"{p}B",
+                                    "Params (B)": p,
+                                    "Est. VRAM (GB)": round(p * bytes_per * disc_overhead, 1),
+                                    "Capabilities": "—",
+                                    "Pulls": "",
+                                })
+                except Exception as e:
+                    st.warning(f"HuggingFace scan failed: {e}")
+
+        st.session_state["disc_results"] = compatible
+
+    disc_results = st.session_state.get("disc_results")
+    if disc_results is not None:
+        if disc_results:
+            df_compat = (
+                pd.DataFrame(disc_results)
+                .sort_values(["Source", "Params (B)"], ascending=[True, False])
+                .reset_index(drop=True)
+            )
+            st.success(f"Found **{len(df_compat)}** compatible model variants for **{disc_vram} GB** VRAM at **{disc_prec}**")
+
+            # Quick filter inside the results
+            rf1, rf2 = st.columns(2)
+            with rf1:
+                src_filter = st.multiselect("Filter by source", df_compat["Source"].unique().tolist(), key="disc_src_filter")
+            with rf2:
+                cap_filter = st.multiselect("Filter by capability",
+                    sorted(set(c for row in df_compat["Capabilities"] for c in row.split(", ") if c not in ("—", ""))),
+                    key="disc_cap_filter")
+
+            shown = df_compat
+            if src_filter:
+                shown = shown[shown["Source"].isin(src_filter)]
+            if cap_filter:
+                shown = shown[shown["Capabilities"].apply(lambda x: any(c in x for c in cap_filter))]
+
+            st.dataframe(shown, use_container_width=True, hide_index=True)
+            csv_disc = shown.to_csv(index=False)
+            st.download_button("Export CSV", csv_disc, "compatible_models.csv", "text/csv", key="disc_csv")
+        else:
+            st.info(f"No models found that fit {disc_vram} GB at {disc_prec}. Try increasing VRAM or choosing a smaller precision.")
+
+st.divider()
 with st.expander("Assumptions & Notes"):
     st.markdown("""...""")  # Your original notes
