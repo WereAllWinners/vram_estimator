@@ -14,8 +14,17 @@ import torch
 import altair as alt
 import plotly.express as px
 import GPUtil
+import subprocess
+import platform
+import json
+import os
+import glob as _glob
 
 st.set_page_config(page_title="VRAM Estimator", page_icon="🧠", layout="wide")
+
+# Hardware detection session state
+if "hw_detected_gpus" not in st.session_state:
+    st.session_state["hw_detected_gpus"] = []
 
 # Model + math helpers
 BYTES_PER = {"FP4": 0.5, "FP8": 1.0, "FP16": 2.0, "FP32": 4.0}
@@ -92,6 +101,310 @@ def estimate_memory(
         "activations": conv(activations), "optimizer": conv(optimizer), "grads": conv(grads),
         "master_weights": conv(master_weights), "total": conv(total_bytes), "per_gpu": conv(per_gpu),
     }
+
+# ─── GPU VRAM Database ────────────────────────────────────────────────────────
+# VRAM in GB. APU entries = max GPU-accessible portion of unified system RAM.
+GPU_VRAM_DB = {
+    # === NVIDIA Blackwell ===
+    "GB10":            128,   # DGX Spark – 128 GB LPDDR5X unified (CPU+GPU)
+    "GB200":           384,   # Grace Blackwell NVL72
+    "B200":            192,
+    "B100":            192,
+    "RTX 5090":         32,
+    "RTX 5080":         16,
+    "RTX 5070 Ti":      16,
+    "RTX 5070":         12,
+    "RTX 5060 Ti":      16,
+    "RTX 5060":          8,
+    # === NVIDIA Ada Lovelace (RTX 40xx) ===
+    "RTX 4090":         24,
+    "RTX 4080 Super":   16,
+    "RTX 4080":         16,
+    "RTX 4070 Ti Super":16,
+    "RTX 4070 Ti":      12,
+    "RTX 4070 Super":   12,
+    "RTX 4070":         12,
+    "RTX 4060 Ti 16GB": 16,
+    "RTX 4060 Ti":       8,
+    "RTX 4060":          8,
+    "RTX 4050":          6,
+    # === NVIDIA Ampere (RTX 30xx) ===
+    "RTX 3090 Ti":      24,
+    "RTX 3090":         24,
+    "RTX 3080 Ti":      12,
+    "RTX 3080 12GB":    12,
+    "RTX 3080":         10,
+    "RTX 3070 Ti":       8,
+    "RTX 3070":          8,
+    "RTX 3060 Ti":       8,
+    "RTX 3060":         12,
+    "RTX 3050 8GB":      8,
+    "RTX 3050":          4,
+    # === NVIDIA Turing (RTX 20xx / GTX 16xx) ===
+    "RTX 2080 Ti":      11,
+    "RTX 2080 Super":    8,
+    "RTX 2080":          8,
+    "RTX 2070 Super":    8,
+    "RTX 2070":          8,
+    "RTX 2060 Super":    8,
+    "RTX 2060":          6,
+    "GTX 1660 Super":    6,
+    "GTX 1660 Ti":       6,
+    "GTX 1660":          6,
+    "GTX 1650 Super":    4,
+    "GTX 1650":          4,
+    # === NVIDIA Data Center / HPC ===
+    "H200":            141,
+    "H100 80GB":        80,
+    "H100":             80,
+    "A100 80GB":        80,
+    "A100":             40,
+    "A40":              48,
+    "A30":              24,
+    "A10G":             24,
+    "A10":              24,
+    "L40S":             48,
+    "L40":              48,
+    "L4":               24,
+    "V100 32GB":        32,
+    "V100":             16,
+    "T4":               16,
+    "P100 16GB":        16,
+    "P100":             12,
+    # === NVIDIA Quadro / RTX Professional ===
+    "RTX 6000 Ada":     48,
+    "RTX 5000 Ada":     32,
+    "RTX 4500 Ada":     24,
+    "RTX 4000 Ada":     20,
+    "RTX A6000":        48,
+    "RTX A5500":        24,
+    "RTX A5000":        24,
+    "RTX A4500":        20,
+    "RTX A4000":        16,
+    "RTX A2000 12GB":   12,
+    "RTX A2000":         6,
+    # === AMD RDNA 4 ===
+    "RX 9070 XT":       16,
+    "RX 9070":          16,
+    "RX 9060 XT":       16,
+    "RX 9060":           8,
+    # === AMD RDNA 3 ===
+    "RX 7900 XTX":      24,
+    "RX 7900 XT":       20,
+    "RX 7900 GRE":      16,
+    "RX 7800 XT":       16,
+    "RX 7700 XT":       12,
+    "RX 7600 XT":       16,
+    "RX 7600":           8,
+    "RX 7500 XT":        8,
+    # === AMD RDNA 2 ===
+    "RX 6950 XT":       16,
+    "RX 6900 XT":       16,
+    "RX 6800 XT":       16,
+    "RX 6800":          16,
+    "RX 6750 XT":       12,
+    "RX 6700 XT":       12,
+    "RX 6700":          10,
+    "RX 6650 XT":        8,
+    "RX 6600 XT":        8,
+    "RX 6600":           8,
+    "RX 6500 XT":        4,
+    "RX 6400":           4,
+    # === AMD APU / Integrated — Strix Halo (RDNA 3.5) ===
+    # Strix Halo uses LPDDR5X unified memory shared with CPU.
+    # GPU can access up to ~96 GB on 128 GB configs (OS/CPU reserve ~32 GB).
+    "Radeon 8060S":     96,   # Strix Halo iGPU (Ryzen AI Max), 40 CU RDNA 3.5
+    "Radeon 8050S":     64,   # Strix Halo lower tier
+    "Radeon 890M":      96,   # Alt branding for Strix Halo 40 CU iGPU
+    "Radeon 880M":      24,   # Strix Point / Hawk Point
+    "Radeon 870M":      16,
+    "Radeon 860M":      12,
+    "Radeon 850M":       8,
+    "Radeon 780M":      16,   # Phoenix
+    "Radeon 760M":       8,
+    "Radeon 740M":       4,
+    "Vega 11":          16,
+    "Vega 8":           16,
+    "Vega 7":           16,
+    # === AMD Instinct / Data Center ===
+    "MI350X":          288,
+    "MI325X":          288,
+    "MI300X":          192,
+    "MI300A":          128,
+    "MI250X":          128,
+    "MI250":           128,
+    "MI210":            64,
+    "MI100":            32,
+    # === Intel Arc ===
+    "Arc B580":         12,
+    "Arc B570":         10,
+    "Arc A770 16GB":    16,
+    "Arc A770":          8,
+    "Arc A750":          8,
+    "Arc A580":          8,
+    "Arc A380":          6,
+    "Arc A310":          4,
+}
+
+# Keywords that identify an APU / integrated / unified-memory GPU
+_APU_KEYWORDS = {
+    "890M", "880M", "870M", "860M", "850M",
+    "780M", "760M", "740M", "8060S", "8050S",
+    "VEGA 8", "VEGA 7", "VEGA 11",
+    "IRIS XE", "IRIS PLUS", "UHD GRAPHICS",
+}
+
+
+def _fuzzy_vram_lookup(gpu_name: str):
+    """Return VRAM (GB) from GPU_VRAM_DB via longest substring match, or None."""
+    name_upper = gpu_name.upper()
+    best_vram, best_len = None, 0
+    for key, vram in GPU_VRAM_DB.items():
+        if key.upper() in name_upper and len(key) > best_len:
+            best_vram, best_len = vram, len(key)
+    return best_vram
+
+
+def detect_gpus() -> list:
+    """
+    Multi-method GPU detection. Supports:
+      - NVIDIA (nvidia-smi, GPUtil)        — discrete + GB10 Superchip (DGX Spark)
+      - AMD discrete (rocm-smi)            — RX 6000/7000/9000 series
+      - AMD APU / Strix Halo (WMI/sysfs)  — Radeon 8060S, 890M, etc.
+      - Intel Arc (WMI / sysfs)
+    Returns list of dicts: {name, vram_gb, gpu_type, method, notes}
+    """
+    results, seen = [], set()
+
+    def _add(name, vram_gb, gpu_type, method, notes=""):
+        key = name.strip().lower()
+        if key not in seen and vram_gb and vram_gb > 0:
+            seen.add(key)
+            results.append({
+                "name": name.strip(),
+                "vram_gb": round(float(vram_gb), 1),
+                "gpu_type": gpu_type,
+                "method": method,
+                "notes": notes,
+            })
+
+    # ── 1. nvidia-smi (most reliable for NVIDIA + GB10 Superchip) ────────────
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+                    name = parts[0]
+                    vram_gb = int(parts[1]) / 1024          # MiB → GB
+                    note = ("Unified memory – CPU+GPU share 128 GB LPDDR5X"
+                            if "GB10" in name.upper() else "")
+                    _add(name, vram_gb, "NVIDIA", "nvidia-smi", note)
+    except Exception:
+        pass
+
+    # ── 2. GPUtil fallback (NVIDIA only, no nvidia-smi needed) ───────────────
+    if not any(g["gpu_type"] == "NVIDIA" for g in results):
+        try:
+            for g in GPUtil.getGPUs():
+                _add(g.name, g.memoryTotal / 1024, "NVIDIA", "GPUtil")
+        except Exception:
+            pass
+
+    # ── 3. rocm-smi (AMD discrete GPUs with ROCm driver) ─────────────────────
+    try:
+        proc = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            for card_id, info in data.items():
+                if not isinstance(info, dict):
+                    continue
+                name = (info.get("Card series")
+                        or info.get("Card model")
+                        or f"AMD GPU ({card_id})")
+                vram_b = int(info.get("VRAM Total Memory (B)", 0))
+                if vram_b:
+                    _add(name, vram_b / 1e9, "AMD", "rocm-smi")
+    except Exception:
+        pass
+
+    # ── 4. Windows WMI — covers AMD APUs, iGPUs, Intel Arc ───────────────────
+    if platform.system() == "Windows":
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-WmiObject Win32_VideoController | "
+                 "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                raw = json.loads(proc.stdout)
+                if isinstance(raw, dict):
+                    raw = [raw]
+                for item in raw:
+                    name = (item.get("Name") or "").strip()
+                    if not name or name.lower() in seen:
+                        continue
+                    nu = name.upper()
+                    gpu_type = (
+                        "NVIDIA" if any(x in nu for x in ["NVIDIA", "GEFORCE", "QUADRO", "TESLA"]) else
+                        "AMD"    if any(x in nu for x in ["AMD", "RADEON", "VEGA"]) else
+                        "Intel"  if any(x in nu for x in ["INTEL", "ARC", "IRIS", "UHD"]) else
+                        "Unknown"
+                    )
+                    is_apu = any(kw in nu for kw in _APU_KEYWORDS)
+                    db_vram = _fuzzy_vram_lookup(name)
+                    wmi_ram = item.get("AdapterRAM") or 0
+
+                    if db_vram:
+                        vram_gb = db_vram
+                        note = (
+                            "APU / unified memory — GPU shares system LPDDR5X RAM; "
+                            "max VRAM depends on total RAM and BIOS allocation"
+                            if is_apu else "VRAM from database"
+                        )
+                    elif wmi_ram and wmi_ram > 256 * 1024 * 1024:
+                        vram_gb = wmi_ram / 1e9
+                        note = "VRAM reported by WMI driver"
+                    else:
+                        continue   # can't determine VRAM — skip
+
+                    _add(name, vram_gb, gpu_type, "WMI", note)
+        except Exception:
+            pass
+
+    # ── 5. Linux sysfs (AMD discrete + APU) ──────────────────────────────────
+    if platform.system() == "Linux":
+        for mem_path in _glob.glob("/sys/class/drm/card*/device/mem_info_vram_total"):
+            dev = os.path.dirname(mem_path)
+            try:
+                vendor_path = os.path.join(dev, "vendor")
+                with open(vendor_path) as f:
+                    if f.read().strip() != "0x1002":
+                        continue
+                with open(mem_path) as f:
+                    vram_b = int(f.read().strip())
+                name = "AMD GPU"
+                uevent = os.path.join(dev, "uevent")
+                if os.path.exists(uevent):
+                    with open(uevent) as f:
+                        for line in f:
+                            if line.startswith("PCI_ID="):
+                                name = f"AMD GPU [{line.split('=')[1].strip()}]"
+                db_vram = _fuzzy_vram_lookup(name)
+                _add(name, db_vram or vram_b / 1e9, "AMD", "sysfs")
+            except Exception:
+                continue
+
+    return results
+
 
 # UI
 st.title("🧠 VRAM Requirement Estimator")
@@ -257,22 +570,58 @@ with st.sidebar:
 
     st.subheader("Parallelism & Hardware")
     num_gpus = st.slider("Number of GPUs", 1, 8, 1)
-    per_gpu_vram = st.number_input(f"VRAM per GPU ({unit_label.split()[0]})", min_value=0.0, value=48.0, step=1.0)
-    available_vram = per_gpu_vram * num_gpus  # Backend math for total
+
+    # ── Detected GPU picker (populated after "Detect Hardware") ───────────────
+    _detected = st.session_state.get("hw_detected_gpus", [])
+    if _detected:
+        _labels = [
+            f"{g['name']}  ({g['vram_gb']} GB  ·  {g['gpu_type']}  ·  {g['method']})"
+            for g in _detected
+        ]
+        _sel_idx = st.selectbox(
+            "Detected GPU", range(len(_labels)),
+            format_func=lambda i: _labels[i], key="hw_gpu_sel",
+        )
+        _sel = _detected[_sel_idx]
+        if _sel.get("notes"):
+            st.caption(f"ℹ️ {_sel['notes']}")
+        _vram_default = float(_sel["vram_gb"])
+    else:
+        _vram_default = 48.0
+
+    per_gpu_vram = st.number_input(
+        f"VRAM per GPU ({unit_label.split()[0]})",
+        min_value=0.0, value=_vram_default, step=1.0,
+    )
+    available_vram = per_gpu_vram * num_gpus
 
     parallelism_type = st.selectbox("Strategy", ["None", "Tensor Parallel", "Pipeline Parallel", "Data Parallel"])
 
     benchmark = st.checkbox("Run Benchmark for Activations (Slow)")
 
-    if st.button("Detect Hardware"):
-        gpus = GPUtil.getGPUs()
-        if gpus:
-            detected_per_gpu = gpus[0].memoryTotal / 1024 if unit_label.startswith("GiB") else gpus[0].memoryTotal * (1024**3 / 1e9) / 1024
-            per_gpu_vram = detected_per_gpu  # Update per-GPU input
-            available_vram = per_gpu_vram * num_gpus  # Recompute total
-            st.write(f"Detected per GPU: {per_gpu_vram:.2f} {unit_label.split()[0]} (Total: {available_vram:.2f})")
+    # Show detection results banner (set before st.rerun() in button handler)
+    if st.session_state.get("hw_just_detected"):
+        for g in _detected:
+            note_str = f"  — {g['notes']}" if g.get("notes") else ""
+            st.success(f"✅ {g['gpu_type']}: **{g['name']}** · {g['vram_gb']} GB{note_str}")
+        del st.session_state["hw_just_detected"]
+
+    if st.button("🔍 Detect Hardware"):
+        with st.spinner("Scanning for GPUs…"):
+            _found = detect_gpus()
+        if _found:
+            st.session_state["hw_detected_gpus"] = _found
+            st.session_state["hw_just_detected"] = True
+            try:
+                st.rerun()
+            except AttributeError:
+                st.experimental_rerun()
         else:
-            st.warning("No GPU detected.")
+            st.warning(
+                "No GPU detected. Possible reasons: no discrete GPU, "
+                "missing drivers (nvidia-smi / ROCm), or running in a VM. "
+                "Enter VRAM manually above."
+            )
 
 # Compute
 res = estimate_memory(task, shape, wprec, kvprec, actprec, seq_len, batch_tokens, lora_rank, unit_divisor, num_gpus, parallelism_type, benchmark)
