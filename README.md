@@ -9,7 +9,7 @@
   # Windows:
   .\venv\Scripts\Activate
 
-  # Liunx
+  # Linux:
   source venv/bin/activate
 
 # install the requirements
